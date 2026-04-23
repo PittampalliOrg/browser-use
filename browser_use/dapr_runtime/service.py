@@ -545,26 +545,53 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 	async def _on_step(browser_state: Any, model_output: Any, step_info: Any) -> None:
 		step_idx = int(getattr(step_info, 'step_number', 0) or len(emitted_action_ids) + 1)
 
-		# Flush pending tool_results for every prior step whose actions have
-		# completed. `browser_state.screenshot` is a base64 PNG of the CURRENT
-		# observation — i.e. the page state immediately after step N-1's
-		# actions. We attach it as a thumbnail to the latest flushed step so
-		# the Timeline gets a live filmstrip.
+		# Flush pending tool_results for every prior step using the CURRENT
+		# observation's screenshot as the post-action state. browser-use
+		# doesn't always populate agent.state.history at _on_step time, so we
+		# emit tool_result purely from the tool_use_ids tracked in
+		# emitted_action_ids. The `output` field is left empty since the
+		# ActionResult isn't yet accessible — this is a Timeline-visibility
+		# emission; the final _on_done call re-emits the terminal step with
+		# full extracted_content + error info.
 		post_action_b64 = getattr(browser_state, 'screenshot', None)
 		thumbnail = _thumbnail_screenshot(source_b64=post_action_b64) if post_action_b64 else None
-		# The agent's history typically has one entry per completed step.
-		history_now = list(getattr(getattr(agent, 'state', None), 'history', None) or [])
+		page_url = getattr(browser_state, 'url', None)
 		start = last_emitted_result_step['value']
-		# Emit all previously-untouched completed steps; the freshest
-		# thumbnail applies to the most recent one only.
-		for history_idx in range(start, len(history_now)):
-			is_latest = history_idx == len(history_now) - 1
-			_emit_tool_result_for_step(
-				history_idx,
-				history_now[history_idx],
-				thumbnail if is_latest else None,
-			)
-			last_emitted_result_step['value'] = history_idx + 1
+		for prev_idx in range(start, len(emitted_action_ids)):
+			_prev_step, prev_action_ids = emitted_action_ids[prev_idx]
+			if not prev_action_ids:
+				last_emitted_result_step['value'] = prev_idx + 1
+				continue
+			is_latest = prev_idx == len(emitted_action_ids) - 1
+			# One tool_result per planned action; the thumbnail attaches to
+			# the LAST action of the LATEST flushed step only (a single
+			# post-step screenshot).
+			for action_idx, tool_use_id in enumerate(prev_action_ids):
+				attach = (
+					thumbnail
+					if (is_latest and action_idx == len(prev_action_ids) - 1)
+					else None
+				)
+				content: list[dict[str, Any]] = []
+				if attach is not None:
+					media_type, b64 = attach
+					content.append(
+						{
+							'type': 'image',
+							'source': {'type': 'base64', 'media_type': media_type, 'data': b64},
+						}
+					)
+				payload: dict[str, Any] = {
+					'tool_use_id': tool_use_id,
+					'output': '',
+					'stepNumber': _prev_step,
+				}
+				if page_url:
+					payload['url'] = str(page_url)
+				if content:
+					payload['content'] = content
+				_publish_session_event(session_id, 'agent.tool_result', payload)
+			last_emitted_result_step['value'] = prev_idx + 1
 
 		current_state = getattr(model_output, 'current_state', None)
 
