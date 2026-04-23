@@ -626,19 +626,49 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 		# which handles both the path-not-set and file-missing edge cases.
 		step_items = list(getattr(history_list, 'history', None) or [])
 		start = last_emitted_result_step['value']
+		logger.info(
+			'[tool_result] _on_done draining history %d..%d (total %d items)',
+			start,
+			len(step_items),
+			len(step_items),
+		)
 		for history_idx in range(start, len(step_items)):
 			item = step_items[history_idx]
 			is_latest = history_idx == len(step_items) - 1
 			thumbnail = None
 			if is_latest:
 				state = getattr(item, 'state', None)
-				if state is not None and hasattr(state, 'get_screenshot'):
+				state_type = type(state).__name__ if state is not None else 'None'
+				has_gs = state is not None and hasattr(state, 'get_screenshot')
+				spath = getattr(state, 'screenshot_path', None) if state is not None else None
+				logger.info(
+					'[tool_result] step=%d state_type=%s has_get_screenshot=%s screenshot_path=%s',
+					history_idx + 1,
+					state_type,
+					has_gs,
+					spath,
+				)
+				b64: str | None = None
+				if has_gs:
 					try:
 						b64 = state.get_screenshot()
-					except Exception:
-						b64 = None
-					if b64:
-						thumbnail = _thumbnail_screenshot(source_b64=b64)
+					except Exception as exc:
+						logger.warning('[tool_result] get_screenshot() raised: %s', exc)
+				# Fallback: read the disk path directly and base64-encode.
+				if not b64 and spath:
+					try:
+						p = Path(spath)
+						if p.exists():
+							b64 = base64.b64encode(p.read_bytes()).decode('utf-8')
+					except Exception as exc:
+						logger.warning('[tool_result] direct-read fallback failed: %s', exc)
+				if b64:
+					thumbnail = _thumbnail_screenshot(source_b64=b64)
+					logger.info(
+						'[tool_result] thumbnail_ok=%s raw_b64_len=%d',
+						thumbnail is not None,
+						len(b64),
+					)
 			_emit_tool_result_for_step(history_idx, item, thumbnail)
 			last_emitted_result_step['value'] = history_idx + 1
 
