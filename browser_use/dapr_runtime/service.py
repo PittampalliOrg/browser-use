@@ -622,7 +622,8 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 		# Drain any step(s) that completed after the last _on_step emission —
 		# typically just the terminal step (since _on_step only sees up to
 		# step N-1's history when it fires for step N). Thumbnail comes from
-		# the disk-persisted screenshot of the final state.
+		# the disk-persisted screenshot via BrowserStateHistory.get_screenshot(),
+		# which handles both the path-not-set and file-missing edge cases.
 		step_items = list(getattr(history_list, 'history', None) or [])
 		start = last_emitted_result_step['value']
 		for history_idx in range(start, len(step_items)):
@@ -631,9 +632,13 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 			thumbnail = None
 			if is_latest:
 				state = getattr(item, 'state', None)
-				path_str = getattr(state, 'screenshot_path', None) if state is not None else None
-				if path_str:
-					thumbnail = _thumbnail_screenshot(source_path=Path(path_str))
+				if state is not None and hasattr(state, 'get_screenshot'):
+					try:
+						b64 = state.get_screenshot()
+					except Exception:
+						b64 = None
+					if b64:
+						thumbnail = _thumbnail_screenshot(source_b64=b64)
 			_emit_tool_result_for_step(history_idx, item, thumbnail)
 			last_emitted_result_step['value'] = history_idx + 1
 
