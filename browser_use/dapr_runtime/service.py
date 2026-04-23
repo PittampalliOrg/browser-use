@@ -130,10 +130,33 @@ def _save_session_state(session_id: str, state: DurableSessionState) -> None:
 
 
 def _publish_session_event(session_id: str, event_type: str, data: dict[str, Any] | None = None) -> None:
-	"""Persist a session event into workflow-builder, best-effort."""
+	"""Persist a session event into workflow-builder, best-effort.
+
+	Stamps ``traceId`` + ``spanId`` of the currently-active OTEL span onto
+	the envelope's ``data`` payload so the Timeline UI can deep-link each
+	event row into Phoenix / ClickHouse without needing a separate
+	correlation step. Mirrors dapr-agent-py's
+	``services/dapr-agent-py/src/event_publisher.py::publish_session_event``
+	behavior (lines 277-291 in that file).
+	"""
 	internal_token = os.environ.get('INTERNAL_API_TOKEN', '').strip()
 	if not internal_token or not session_id:
 		return
+
+	payload = dict(data or {})
+	# Stamp trace context so the UI can deep-link this event to its Phoenix
+	# trace. Best-effort — returns (None, None) when telemetry isn't wired.
+	try:
+		from browser_use.dapr_runtime.telemetry import get_current_trace_context
+
+		trace_id, span_id = get_current_trace_context()
+		if trace_id:
+			payload.setdefault('traceId', trace_id)
+		if span_id:
+			payload.setdefault('spanId', span_id)
+	except Exception:
+		pass
+
 	app_id = os.environ.get('WORKFLOW_BUILDER_APP_ID', 'workflow-builder')
 	url = (
 		f"{_dapr_http_base()}/v1.0/invoke/{urllib.parse.quote(app_id, safe='')}"
@@ -141,7 +164,7 @@ def _publish_session_event(session_id: str, event_type: str, data: dict[str, Any
 	)
 	body = {
 		'type': event_type,
-		'data': data or {},
+		'data': payload,
 		'producerId': os.environ.get('AGENT_SLUG', SERVICE_NAME),
 		'producerEpoch': os.environ.get('HOSTNAME', SERVICE_NAME),
 	}
@@ -192,6 +215,8 @@ def _freeze_session_child_input(
 		'executionId': db_execution_id,
 		'dbExecutionId': db_execution_id,
 		'workflowExecutionId': db_execution_id,
+		'workflowId': raw_message.get('workflowId'),
+		'nodeId': raw_message.get('nodeId'),
 		'agentConfig': agent_cfg,
 		'vaultIds': vault_ids,
 		'sandboxName': raw_message.get('sandboxName'),
@@ -423,9 +448,29 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 	extend_system_message = _build_agent_instruction_block(agent_config)
 	injected_state = session_state if has_persisted_session_history(session_state) else None
 	latest_step_text: dict[str, str | None] = {'value': None}
+	# Stable id per (step, action) so agent.tool_use and agent.tool_result can
+	# be linked by the Timeline's grouping logic. Populated in _on_step,
+	# consumed in _on_done.
+	emitted_action_ids: list[tuple[int, list[str]]] = []
 
-	async def _on_step(_browser_state: Any, model_output: Any, _step_info: Any) -> None:
-		goal = getattr(getattr(model_output, 'current_state', None), 'next_goal', None)
+	async def _on_step(_browser_state: Any, model_output: Any, step_info: Any) -> None:
+		step_idx = int(getattr(step_info, 'step_number', 0) or len(emitted_action_ids) + 1)
+		current_state = getattr(model_output, 'current_state', None)
+
+		# agent.thinking — full chain-of-thought from the LLM (when present)
+		# or the evaluation_previous_goal as fallback.
+		thinking_text = getattr(model_output, 'thinking', None) or getattr(
+			current_state, 'evaluation_previous_goal', None
+		)
+		if thinking_text:
+			_publish_session_event(
+				session_id,
+				'agent.thinking',
+				{'thinking': str(thinking_text), 'type': 'text'},
+			)
+
+		# agent.message — next_goal, preserved behavior
+		goal = getattr(current_state, 'next_goal', None)
 		if goal:
 			latest_step_text['value'] = str(goal)
 			_publish_session_event(
@@ -437,6 +482,81 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 				},
 			)
 
+		# agent.tool_use — one event per planned action on this step.
+		actions = list(getattr(model_output, 'action', None) or [])
+		ids_this_step: list[str] = []
+		for action_idx, action in enumerate(actions):
+			action_id = f'step-{step_idx}-action-{action_idx}'
+			ids_this_step.append(action_id)
+			# ActionModel is a dynamic Pydantic model: exactly one field is
+			# populated, named after the action. Extract both.
+			try:
+				dumped = action.model_dump(exclude_none=True) if hasattr(action, 'model_dump') else dict(action or {})
+			except Exception:
+				dumped = {}
+			action_name = next(iter(dumped.keys()), 'unknown') if dumped else 'unknown'
+			action_input = dumped.get(action_name) if dumped else {}
+			_publish_session_event(
+				session_id,
+				'agent.tool_use',
+				{
+					'id': action_id,
+					'name': str(action_name),
+					'input': action_input if isinstance(action_input, dict) else {'value': action_input},
+				},
+			)
+		emitted_action_ids.append((step_idx, ids_this_step))
+
+	async def _on_done(history_list: 'AgentHistoryList') -> None:
+		# agent.tool_result — one per executed action, pairing with the
+		# agent.tool_use ids emitted in _on_step by chronological ordering.
+		# The Timeline groups tool_use+tool_result by id when present.
+		step_items = list(getattr(history_list, 'history', None) or [])
+		for history_idx, item in enumerate(step_items):
+			# `item.result` is a list[ActionResult] parallel to the actions
+			# that were planned for this step.
+			results = list(getattr(item, 'result', None) or [])
+			if history_idx >= len(emitted_action_ids):
+				break
+			_step_idx, action_ids = emitted_action_ids[history_idx]
+			for action_idx, res in enumerate(results):
+				tool_use_id = action_ids[action_idx] if action_idx < len(action_ids) else f'{_step_idx}-{action_idx}'
+				extracted = getattr(res, 'extracted_content', None)
+				error = getattr(res, 'error', None)
+				payload_out: dict[str, Any] = {
+					'tool_use_id': tool_use_id,
+					'output': str(extracted) if extracted is not None else '',
+				}
+				if error:
+					payload_out['error'] = str(error)
+					payload_out['is_error'] = True
+				_publish_session_event(session_id, 'agent.tool_result', payload_out)
+
+	# Wrap the browser-use run in a span so Phoenix/Tempo shows a single
+	# `browser_use.agent.turn` tree per turn, with session.id / workflow
+	# attributes that match the ClickHouse filter in
+	# src/lib/server/otel/clickhouse.ts:70-92.
+	try:
+		from browser_use.dapr_runtime.telemetry import get_tracer
+	except Exception:
+		get_tracer = lambda: None  # noqa: E731
+
+	tracer = get_tracer()
+	span_cm = (
+		tracer.start_as_current_span(
+			'browser_use.agent.turn',
+			attributes={
+				'session.id': session_id,
+				'agent.slug': os.environ.get('AGENT_SLUG', SERVICE_NAME),
+				'workflow.execution.id': str(payload.get('workflowExecutionId') or ''),
+				'workflow.id': str(payload.get('workflowId') or ''),
+				'agent.turn': turn,
+			},
+		)
+		if tracer is not None
+		else None
+	)
+
 	agent = Agent(
 		task=task,
 		llm=_build_llm(agent_config),
@@ -447,33 +567,56 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 		step_timeout=DEFAULT_STEP_TIMEOUT,
 		injected_agent_state=injected_state,
 		register_new_step_callback=_on_step,
+		register_done_callback=_on_done,
 	)
 
 	history: AgentHistoryList | None = None
 	result_payload: dict[str, Any] | None = None
-	try:
+
+	async def _do_run() -> dict[str, Any]:
+		nonlocal history
 		history = await agent.run(max_steps=max_steps)
-		session_state = DurableSessionState.model_validate(agent.state.model_dump(mode='json'))
-		session_state.browserstation = session_state.browserstation or _load_session_state(session_id).browserstation
-		_save_session_state(session_id, session_state)
-		final_content = history.final_result() or latest_step_text['value'] or ''
-		if final_content:
+		assert history is not None
+		session_state_local = DurableSessionState.model_validate(agent.state.model_dump(mode='json'))
+		session_state_local.browserstation = session_state_local.browserstation or _load_session_state(session_id).browserstation
+		_save_session_state(session_id, session_state_local)
+		final_content_local = history.final_result() or latest_step_text['value'] or ''
+		if final_content_local:
 			_publish_session_event(
 				session_id,
 				'agent.message',
 				{
 					'role': 'assistant',
-					'content': [{'type': 'text', 'text': str(final_content)}],
+					'content': [{'type': 'text', 'text': str(final_content_local)}],
 				},
 			)
-		result_payload = {
+		# agent.llm_usage — best-effort, aggregated per-turn. Timeline renders
+		# it as a small tile. Fields optional; Timeline tolerates absent keys.
+		try:
+			tokens = getattr(agent.state, 'usage', None) or getattr(agent.state, 'tokens_used', None)
+			if tokens is not None and hasattr(tokens, 'model_dump'):
+				usage_dump = tokens.model_dump(exclude_none=True)
+				if usage_dump:
+					_publish_session_event(session_id, 'agent.llm_usage', {'usage': usage_dump})
+			elif isinstance(tokens, dict) and tokens:
+				_publish_session_event(session_id, 'agent.llm_usage', {'usage': tokens})
+		except Exception:
+			pass
+		return {
 			'success': bool(history.is_successful() if history.is_done() else not history.has_errors()),
-			'content': str(final_content),
+			'content': str(final_content_local),
 			'urls': history.urls(),
 			'errors': [error for error in history.errors() if error],
 			'sessionId': session_id,
 			'turn': turn,
 		}
+
+	try:
+		if span_cm is not None:
+			with span_cm:
+				result_payload = await _do_run()
+		else:
+			result_payload = await _do_run()
 		return result_payload
 	finally:
 		await close_mcp_clients(mcp_clients)
@@ -615,10 +758,27 @@ runner = AgentRunner()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+	# Initialize OpenTelemetry providers (traces, metrics, logs). No-op when
+	# OTEL_EXPORTER_OTLP_ENDPOINT is unset; safe to call on every pod boot.
+	try:
+		from browser_use.dapr_runtime.telemetry import init_telemetry, shutdown_telemetry
+
+		init_telemetry()
+	except Exception as exc:  # noqa: BLE001
+		logger.warning('Telemetry init failed: %s', exc)
+		shutdown_telemetry = None  # type: ignore[assignment]
+
 	logger.info('%s starting', SERVICE_NAME)
-	yield
-	logger.info('%s shutting down', SERVICE_NAME)
-	runner.shutdown(agent)
+	try:
+		yield
+	finally:
+		logger.info('%s shutting down', SERVICE_NAME)
+		runner.shutdown(agent)
+		if shutdown_telemetry is not None:
+			try:
+				shutdown_telemetry()
+			except Exception:
+				logger.debug('shutdown_telemetry failed', exc_info=True)
 
 
 app = FastAPI(
