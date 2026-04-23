@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
 import os
@@ -287,6 +288,40 @@ def _file_to_base64(path: Path) -> str:
 	return base64.b64encode(path.read_bytes()).decode('utf-8')
 
 
+def _thumbnail_screenshot(
+	source_b64: str | None = None,
+	source_path: Path | None = None,
+	max_width: int = 720,
+	quality: int = 70,
+) -> tuple[str, str] | None:
+	"""Produce a (media_type, base64) JPEG thumbnail suitable for inline Timeline rendering.
+
+	Accepts a PNG/JPEG either as base64 (from ``BrowserStateSummary.screenshot``)
+	or as a disk path (from ``AgentHistory.state.screenshot_path``). Returns
+	None on any error so the emit path can skip the image gracefully — an
+	event with the text content still goes through.
+
+	Target ~15-40 KB base64 to keep session_events rows + SSE frames small.
+	"""
+	try:
+		from PIL import Image
+
+		if source_b64 is not None:
+			raw = base64.b64decode(source_b64)
+		elif source_path is not None and source_path.exists():
+			raw = source_path.read_bytes()
+		else:
+			return None
+		img = Image.open(io.BytesIO(raw))
+		img.thumbnail((max_width, max_width * 2))
+		out = io.BytesIO()
+		img.convert('RGB').save(out, format='JPEG', quality=quality, optimize=True)
+		return ('image/jpeg', base64.b64encode(out.getvalue()).decode('ascii'))
+	except Exception:
+		logger.debug('screenshot thumbnail failed', exc_info=True)
+		return None
+
+
 def _step_timestamp_iso(step_metadata: Any) -> str | None:
 	if step_metadata is None:
 		return None
@@ -450,11 +485,87 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 	latest_step_text: dict[str, str | None] = {'value': None}
 	# Stable id per (step, action) so agent.tool_use and agent.tool_result can
 	# be linked by the Timeline's grouping logic. Populated in _on_step,
-	# consumed in _on_done.
+	# consumed when emitting tool_result (from the next _on_step for prior
+	# steps, and from _on_done for the terminal step).
 	emitted_action_ids: list[tuple[int, list[str]]] = []
+	# Tracks the last step index whose tool_result events have been emitted.
+	# _on_step drains everything up to (but not including) the current step's
+	# index; _on_done drains the rest (typically just the terminal step).
+	last_emitted_result_step: dict[str, int] = {'value': 0}
 
-	async def _on_step(_browser_state: Any, model_output: Any, step_info: Any) -> None:
+	def _emit_tool_result_for_step(
+		history_idx: int, history_item: Any, post_action_image: tuple[str, str] | None
+	) -> None:
+		"""Emit one ``agent.tool_result`` per ActionResult in this step.
+
+		`post_action_image` is a (media_type, base64) thumbnail of the page
+		AFTER this step's actions executed, to be attached as an Anthropic
+		image content block so the Timeline can render a live filmstrip.
+		When None, the event still goes out with text-only content.
+		"""
+		if history_idx >= len(emitted_action_ids):
+			return
+		_step_idx, action_ids = emitted_action_ids[history_idx]
+		results = list(getattr(history_item, 'result', None) or [])
+		state = getattr(history_item, 'state', None)
+		url = getattr(state, 'url', None) if state is not None else None
+		for action_idx, res in enumerate(results):
+			tool_use_id = action_ids[action_idx] if action_idx < len(action_ids) else f'{_step_idx}-{action_idx}'
+			extracted = getattr(res, 'extracted_content', None)
+			error = getattr(res, 'error', None)
+			output_text = str(extracted) if extracted is not None else ''
+			content: list[dict[str, Any]] = []
+			if output_text:
+				content.append({'type': 'text', 'text': output_text})
+			# Attach the thumbnail to the LAST action of the step only — one
+			# screenshot represents the post-step page state, regardless of
+			# how many actions fired. Avoids N duplicate thumbnails per step.
+			if post_action_image is not None and action_idx == len(results) - 1:
+				media_type, b64 = post_action_image
+				content.append(
+					{
+						'type': 'image',
+						'source': {'type': 'base64', 'media_type': media_type, 'data': b64},
+					}
+				)
+			payload_out: dict[str, Any] = {
+				'tool_use_id': tool_use_id,
+				'output': output_text,
+				'stepNumber': _step_idx,
+			}
+			if url:
+				payload_out['url'] = str(url)
+			if content:
+				payload_out['content'] = content
+			if error:
+				payload_out['error'] = str(error)
+				payload_out['is_error'] = True
+			_publish_session_event(session_id, 'agent.tool_result', payload_out)
+
+	async def _on_step(browser_state: Any, model_output: Any, step_info: Any) -> None:
 		step_idx = int(getattr(step_info, 'step_number', 0) or len(emitted_action_ids) + 1)
+
+		# Flush pending tool_results for every prior step whose actions have
+		# completed. `browser_state.screenshot` is a base64 PNG of the CURRENT
+		# observation — i.e. the page state immediately after step N-1's
+		# actions. We attach it as a thumbnail to the latest flushed step so
+		# the Timeline gets a live filmstrip.
+		post_action_b64 = getattr(browser_state, 'screenshot', None)
+		thumbnail = _thumbnail_screenshot(source_b64=post_action_b64) if post_action_b64 else None
+		# The agent's history typically has one entry per completed step.
+		history_now = list(getattr(getattr(agent, 'state', None), 'history', None) or [])
+		start = last_emitted_result_step['value']
+		# Emit all previously-untouched completed steps; the freshest
+		# thumbnail applies to the most recent one only.
+		for history_idx in range(start, len(history_now)):
+			is_latest = history_idx == len(history_now) - 1
+			_emit_tool_result_for_step(
+				history_idx,
+				history_now[history_idx],
+				thumbnail if is_latest else None,
+			)
+			last_emitted_result_step['value'] = history_idx + 1
+
 		current_state = getattr(model_output, 'current_state', None)
 
 		# agent.thinking — full chain-of-thought from the LLM (when present)
@@ -508,29 +619,23 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 		emitted_action_ids.append((step_idx, ids_this_step))
 
 	async def _on_done(history_list: 'AgentHistoryList') -> None:
-		# agent.tool_result — one per executed action, pairing with the
-		# agent.tool_use ids emitted in _on_step by chronological ordering.
-		# The Timeline groups tool_use+tool_result by id when present.
+		# Drain any step(s) that completed after the last _on_step emission —
+		# typically just the terminal step (since _on_step only sees up to
+		# step N-1's history when it fires for step N). Thumbnail comes from
+		# the disk-persisted screenshot of the final state.
 		step_items = list(getattr(history_list, 'history', None) or [])
-		for history_idx, item in enumerate(step_items):
-			# `item.result` is a list[ActionResult] parallel to the actions
-			# that were planned for this step.
-			results = list(getattr(item, 'result', None) or [])
-			if history_idx >= len(emitted_action_ids):
-				break
-			_step_idx, action_ids = emitted_action_ids[history_idx]
-			for action_idx, res in enumerate(results):
-				tool_use_id = action_ids[action_idx] if action_idx < len(action_ids) else f'{_step_idx}-{action_idx}'
-				extracted = getattr(res, 'extracted_content', None)
-				error = getattr(res, 'error', None)
-				payload_out: dict[str, Any] = {
-					'tool_use_id': tool_use_id,
-					'output': str(extracted) if extracted is not None else '',
-				}
-				if error:
-					payload_out['error'] = str(error)
-					payload_out['is_error'] = True
-				_publish_session_event(session_id, 'agent.tool_result', payload_out)
+		start = last_emitted_result_step['value']
+		for history_idx in range(start, len(step_items)):
+			item = step_items[history_idx]
+			is_latest = history_idx == len(step_items) - 1
+			thumbnail = None
+			if is_latest:
+				state = getattr(item, 'state', None)
+				path_str = getattr(state, 'screenshot_path', None) if state is not None else None
+				if path_str:
+					thumbnail = _thumbnail_screenshot(source_path=Path(path_str))
+			_emit_tool_result_for_step(history_idx, item, thumbnail)
+			last_emitted_result_step['value'] = history_idx + 1
 
 	# Wrap the browser-use run in a span so Phoenix/Tempo shows a single
 	# `browser_use.agent.turn` tree per turn, with session.id / workflow
