@@ -619,11 +619,14 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 		emitted_action_ids.append((step_idx, ids_this_step))
 
 	async def _on_done(history_list: 'AgentHistoryList') -> None:
-		# Drain any step(s) that completed after the last _on_step emission —
-		# typically just the terminal step (since _on_step only sees up to
-		# step N-1's history when it fires for step N). Thumbnail comes from
-		# the disk-persisted screenshot via BrowserStateHistory.get_screenshot(),
-		# which handles both the path-not-set and file-missing edge cases.
+		# Drain any step(s) that completed after the last _on_step emission.
+		# Attach the post-action thumbnail to the LAST history item that has
+		# a non-empty `result` list — browser-use often emits a trailing
+		# history item with an empty result (after an LLM produces a `done`
+		# action without a new tool call); inlining the screenshot there
+		# would get dropped because `_emit_tool_result_for_step` iterates
+		# over results. Finding the last-with-results ensures the thumbnail
+		# reaches the Timeline.
 		step_items = list(getattr(history_list, 'history', None) or [])
 		start = last_emitted_result_step['value']
 		logger.info(
@@ -632,45 +635,69 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 			len(step_items),
 			len(step_items),
 		)
-		for history_idx in range(start, len(step_items)):
-			item = step_items[history_idx]
-			is_latest = history_idx == len(step_items) - 1
-			thumbnail = None
-			if is_latest:
-				state = getattr(item, 'state', None)
-				state_type = type(state).__name__ if state is not None else 'None'
-				has_gs = state is not None and hasattr(state, 'get_screenshot')
-				spath = getattr(state, 'screenshot_path', None) if state is not None else None
-				logger.info(
-					'[tool_result] step=%d state_type=%s has_get_screenshot=%s screenshot_path=%s',
-					history_idx + 1,
-					state_type,
-					has_gs,
-					spath,
-				)
-				b64: str | None = None
-				if has_gs:
-					try:
-						b64 = state.get_screenshot()
-					except Exception as exc:
-						logger.warning('[tool_result] get_screenshot() raised: %s', exc)
-				# Fallback: read the disk path directly and base64-encode.
-				if not b64 and spath:
+		# Resolve the thumbnail once (source: latest state with a screenshot).
+		thumbnail: tuple[str, str] | None = None
+		for item in reversed(step_items):
+			state = getattr(item, 'state', None)
+			if state is None:
+				continue
+			b64: str | None = None
+			if hasattr(state, 'get_screenshot'):
+				try:
+					b64 = state.get_screenshot()
+				except Exception as exc:
+					logger.warning('[tool_result] get_screenshot() raised: %s', exc)
+			if not b64:
+				spath = getattr(state, 'screenshot_path', None)
+				if spath:
 					try:
 						p = Path(spath)
 						if p.exists():
 							b64 = base64.b64encode(p.read_bytes()).decode('utf-8')
 					except Exception as exc:
 						logger.warning('[tool_result] direct-read fallback failed: %s', exc)
-				if b64:
-					thumbnail = _thumbnail_screenshot(source_b64=b64)
-					logger.info(
-						'[tool_result] thumbnail_ok=%s raw_b64_len=%d',
-						thumbnail is not None,
-						len(b64),
-					)
-			_emit_tool_result_for_step(history_idx, item, thumbnail)
+			if b64:
+				thumbnail = _thumbnail_screenshot(source_b64=b64)
+				if thumbnail is not None:
+					break
+		logger.info('[tool_result] final thumbnail resolved=%s', thumbnail is not None)
+
+		# Find the last history idx with non-empty results — the thumbnail
+		# attaches there regardless of history ordering.
+		last_with_results = -1
+		for i in range(len(step_items) - 1, start - 1, -1):
+			if list(getattr(step_items[i], 'result', None) or []):
+				last_with_results = i
+				break
+
+		for history_idx in range(start, len(step_items)):
+			item = step_items[history_idx]
+			attach = thumbnail if history_idx == last_with_results else None
+			_emit_tool_result_for_step(history_idx, item, attach)
 			last_emitted_result_step['value'] = history_idx + 1
+
+		# If NO step in this drain range had results (rare — a pure terminal
+		# step with only a done signal), emit a standalone tool_result tied
+		# to the LAST emitted_action_ids entry so the thumbnail isn't lost.
+		if thumbnail is not None and last_with_results == -1 and emitted_action_ids:
+			_step_idx, action_ids = emitted_action_ids[-1]
+			fallback_id = action_ids[-1] if action_ids else f'step-{_step_idx}-action-final'
+			media_type, b64 = thumbnail
+			_publish_session_event(
+				session_id,
+				'agent.tool_result',
+				{
+					'tool_use_id': fallback_id,
+					'output': '',
+					'stepNumber': _step_idx,
+					'content': [
+						{
+							'type': 'image',
+							'source': {'type': 'base64', 'media_type': media_type, 'data': b64},
+						}
+					],
+				},
+			)
 
 	# Wrap the browser-use run in a span so Phoenix/Tempo shows a single
 	# `browser_use.agent.turn` tree per turn, with session.id / workflow
