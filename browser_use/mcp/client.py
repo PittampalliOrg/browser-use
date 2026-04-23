@@ -23,6 +23,8 @@ Example usage:
 """
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import logging
 import time
 from typing import Any
@@ -39,9 +41,58 @@ logger = logging.getLogger(__name__)
 
 # Import MCP SDK
 from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 
 MCP_AVAILABLE = True
+
+
+class MCPServerConfig(BaseModel):
+	"""Connection settings for one MCP server."""
+
+	model_config = ConfigDict(extra='allow')
+
+	server_name: str
+	transport: str = 'stdio'
+	command: str | None = None
+	args: list[str] = Field(default_factory=list)
+	env: dict[str, str] | None = None
+	url: str | None = None
+	headers: dict[str, str] | None = None
+	allowed_tools: list[str] | None = None
+	timeout: float = 30
+	sse_read_timeout: float = 300
+	terminate_on_close: bool = True
+
+	@classmethod
+	def from_workflow_builder(cls, config: dict[str, Any]) -> 'MCPServerConfig':
+		"""Normalize workflow-builder's MCP server shape into a typed config."""
+		server_name = (
+			str(
+				config.get('server_name')
+				or config.get('serverName')
+				or config.get('name')
+				or config.get('displayName')
+				or ''
+			).strip()
+			or 'mcp'
+		)
+		transport = str(config.get('transport') or 'stdio').strip().lower() or 'stdio'
+		url = config.get('url') or config.get('serverUrl')
+		return cls(
+			server_name=server_name,
+			transport=transport,
+			command=config.get('command'),
+			args=list(config.get('args') or []),
+			env=config.get('env'),
+			url=str(url).strip() if isinstance(url, str) and url.strip() else None,
+			headers={str(k): str(v) for k, v in (config.get('headers') or {}).items()},
+			allowed_tools=[str(tool) for tool in (config.get('allowedTools') or [])],
+			timeout=float(config.get('timeout') or 30),
+			sse_read_timeout=float(config.get('sse_read_timeout') or config.get('sseReadTimeout') or 300),
+			terminate_on_close=bool(config.get('terminate_on_close', config.get('terminateOnClose', True))),
+		)
 
 
 class MCPClient:
@@ -50,9 +101,15 @@ class MCPClient:
 	def __init__(
 		self,
 		server_name: str,
-		command: str,
+		command: str | None = None,
 		args: list[str] | None = None,
 		env: dict[str, str] | None = None,
+		transport: str = 'stdio',
+		url: str | None = None,
+		headers: dict[str, str] | None = None,
+		timeout: float = 30,
+		sse_read_timeout: float = 300,
+		terminate_on_close: bool = True,
 	):
 		"""Initialize MCP client.
 
@@ -61,11 +118,23 @@ class MCPClient:
 			command: Command to start the MCP server (e.g., "npx", "python")
 			args: Arguments for the command (e.g., ["@playwright/mcp@latest"])
 			env: Environment variables for the server process
+			transport: MCP transport type: stdio, streamable_http, or sse
+			url: URL for HTTP/SSE transports
+			headers: Optional headers for HTTP/SSE transports
+			timeout: Transport timeout in seconds
+			sse_read_timeout: SSE read timeout in seconds for HTTP/SSE transports
+			terminate_on_close: Whether streamable_http should terminate the session on close
 		"""
 		self.server_name = server_name
-		self.command = command
+		self.command = command or ''
 		self.args = args or []
 		self.env = env
+		self.transport = transport
+		self.url = url
+		self.headers = headers or None
+		self.timeout = timeout
+		self.sse_read_timeout = sse_read_timeout
+		self.terminate_on_close = terminate_on_close
 
 		self.session: ClientSession | None = None
 		self._stdio_task = None
@@ -77,6 +146,22 @@ class MCPClient:
 		self._disconnect_event = asyncio.Event()
 		self._telemetry = ProductTelemetry()
 
+	@classmethod
+	def from_server_config(cls, config: MCPServerConfig) -> 'MCPClient':
+		"""Create an MCP client from a normalized server config."""
+		return cls(
+			server_name=config.server_name,
+			command=config.command,
+			args=config.args,
+			env=config.env,
+			transport=config.transport,
+			url=config.url,
+			headers=config.headers,
+			timeout=config.timeout,
+			sse_read_timeout=config.sse_read_timeout,
+			terminate_on_close=config.terminate_on_close,
+		)
+
 	async def connect(self) -> None:
 		"""Connect to the MCP server and discover available tools."""
 		if self._connected:
@@ -87,14 +172,13 @@ class MCPClient:
 		error_msg = None
 
 		try:
-			logger.info(f"🔌 Connecting to MCP server '{self.server_name}': {self.command} {' '.join(self.args)}")
+			self._disconnect_event = asyncio.Event()
+			logger.info("🔌 Connecting to MCP server '%s' via %s", self.server_name, self.transport)
 
-			# Create server parameters
-			server_params = StdioServerParameters(command=self.command, args=self.args, env=self.env)
-
-			# Start stdio client in background task
 			self._stdio_task = create_task_with_error_handling(
-				self._run_stdio_client(server_params), name='mcp_stdio_client', suppress_exceptions=True
+				self._run_client(),
+				name=f'mcp_{self.transport}_client',
+				suppress_exceptions=True,
 			)
 
 			# Wait for connection to be established
@@ -128,10 +212,57 @@ class MCPClient:
 				)
 			)
 
-	async def _run_stdio_client(self, server_params: StdioServerParameters):
-		"""Run the stdio client connection in a background task."""
+	@asynccontextmanager
+	async def _transport_client(
+		self,
+	) -> AsyncIterator[
+		tuple[
+			Any,
+			Any,
+		]
+	]:
+		"""Open the configured MCP transport and return raw session streams."""
+		if self.transport == 'stdio':
+			if not self.command:
+				raise ValueError(f"MCP server '{self.server_name}' requires command for stdio transport")
+			server_params = StdioServerParameters(command=self.command, args=self.args, env=self.env)
+			async with stdio_client(server_params) as streams:
+				yield streams
+			return
+
+		if self.transport == 'streamable_http':
+			if not self.url:
+				raise ValueError(f"MCP server '{self.server_name}' requires url for streamable_http transport")
+			async with streamablehttp_client(
+				self.url,
+				headers=self.headers,
+				timeout=self.timeout,
+				sse_read_timeout=self.sse_read_timeout,
+				terminate_on_close=self.terminate_on_close,
+			) as streams:
+				read_stream, write_stream, _ = streams
+				yield read_stream, write_stream
+			return
+
+		if self.transport == 'sse':
+			if not self.url:
+				raise ValueError(f"MCP server '{self.server_name}' requires url for sse transport")
+			async with sse_client(
+				self.url,
+				headers=self.headers,
+				timeout=self.timeout,
+				sse_read_timeout=self.sse_read_timeout,
+			) as streams:
+				read_stream, write_stream = streams
+				yield read_stream, write_stream
+			return
+
+		raise ValueError(f"Unsupported MCP transport '{self.transport}' for server '{self.server_name}'")
+
+	async def _run_client(self):
+		"""Run the transport client connection in a background task."""
 		try:
-			async with stdio_client(server_params) as (read_stream, write_stream):
+			async with self._transport_client() as (read_stream, write_stream):
 				self._read_stream = read_stream
 				self._write_stream = write_stream
 
@@ -424,7 +555,7 @@ class MCPClient:
 				# Multiple content items
 				parts = []
 				for item in result.content:
-					if hasattr(item, 'text'):
+					if hasattr(item, 'text') and item.text:
 						parts.append(item.text)
 					elif hasattr(item, 'type') and item.type == 'text':
 						parts.append(str(item))
@@ -517,6 +648,36 @@ class MCPClient:
 			else:
 				# Object without properties - just return dict
 				return dict
+
+
+async def register_mcp_server_configs_to_tools(
+	tools: Tools,
+	server_configs: list[MCPServerConfig],
+) -> list[MCPClient]:
+	"""Register multiple MCP server configs onto a tools registry."""
+	clients: list[MCPClient] = []
+	try:
+		for config in server_configs:
+			client = MCPClient.from_server_config(config)
+			await client.register_to_tools(
+				tools,
+				tool_filter=config.allowed_tools,
+				prefix=f'mcp__{config.server_name}__',
+			)
+			clients.append(client)
+		return clients
+	except Exception:
+		await close_mcp_clients(clients)
+		raise
+
+
+async def close_mcp_clients(clients: list[MCPClient]) -> None:
+	"""Close a list of MCP clients, best-effort."""
+	for client in clients:
+		try:
+			await client.disconnect()
+		except Exception:
+			logger.debug("Failed to disconnect MCP client '%s'", client.server_name, exc_info=True)
 
 		# Handle arrays with specific item types
 		if json_type == 'array':
