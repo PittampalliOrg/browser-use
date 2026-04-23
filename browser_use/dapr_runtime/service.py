@@ -662,13 +662,22 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 					break
 		logger.info('[tool_result] final thumbnail resolved=%s', thumbnail is not None)
 
-		# Find the last history idx with non-empty results — the thumbnail
-		# attaches there regardless of history ordering.
+		# Find the last history idx that `_emit_tool_result_for_step` will
+		# actually publish for (requires a corresponding emitted_action_ids
+		# entry AND a non-empty result list — actions that bypass the
+		# register_new_step_callback path don't get emit slots).
 		last_with_results = -1
 		for i in range(len(step_items) - 1, start - 1, -1):
+			if i >= len(emitted_action_ids):
+				continue
 			if list(getattr(step_items[i], 'result', None) or []):
 				last_with_results = i
 				break
+		logger.info(
+			'[tool_result] last_with_results=%d emitted_action_ids=%d',
+			last_with_results,
+			len(emitted_action_ids),
+		)
 
 		for history_idx in range(start, len(step_items)):
 			item = step_items[history_idx]
