@@ -20,11 +20,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from google.protobuf import wrappers_pb2
 
-from browser_use import Agent, Browser, ChatAnthropic, ChatBrowserUse, ChatGoogle, ChatOpenAI, Tools
+from browser_use import Agent, Browser, Tools
 from browser_use.agent.views import AgentHistoryList
 from browser_use.dapr_runtime.browserstation import BrowserstationClient, BrowserstationSessionState
+from browser_use.dapr_runtime.llm import build_llm as _build_llm
 from browser_use.dapr_runtime.models import DurableSessionState, has_persisted_session_history
-from browser_use.llm.base import BaseChatModel
 from browser_use.mcp.client import MCPServerConfig, close_mcp_clients, register_mcp_server_configs_to_tools
 
 try:
@@ -249,24 +249,6 @@ def _build_agent_instruction_block(agent_config: dict[str, Any]) -> str | None:
 		if text:
 			lines.append(f'Style: {text}')
 	return '\n'.join(lines) if lines else None
-
-
-def _build_llm(agent_config: dict[str, Any]) -> BaseChatModel:
-	model_spec = str(agent_config.get('modelSpec') or '').strip()
-	if not model_spec:
-		return ChatBrowserUse()
-
-	raw_model = model_spec.split('/', 1)[1] if '/' in model_spec else model_spec
-	lowered = model_spec.lower()
-	if lowered.startswith('anthropic/') or raw_model.startswith('claude'):
-		return ChatAnthropic(model=raw_model)
-	if lowered.startswith('google/') or raw_model.startswith('gemini'):
-		return ChatGoogle(model=raw_model)
-	if lowered.startswith('openai/') or raw_model.startswith(('gpt', 'o1', 'o3', 'o4')):
-		return ChatOpenAI(model=raw_model)
-	if lowered.startswith('browser-use/') or lowered.startswith('browser_use/') or raw_model.startswith('browser-use'):
-		return ChatBrowserUse(model=raw_model)
-	return ChatBrowserUse(model=raw_model)
 
 
 def _artifact_capture_config(agent_config: dict[str, Any]) -> dict[str, bool]:
