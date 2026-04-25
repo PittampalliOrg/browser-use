@@ -588,21 +588,33 @@ class DomService:
 
 		# Extract results, tracking which ones failed
 		results = {}
-		failed = []
+		failed: list[str] = []
+		# Per-call telemetry: tag each failure with the elapsed wall-clock time
+		# from the start of the parallel CDP fan-out. Lets operators distinguish
+		# "Chrome unresponsive" (full timeout budget ~12s consumed) from an
+		# "early raise" (sub-second, indicates a different upstream bug).
+		elapsed_ms = int((time.time() - start_cdp_calls) * 1000)
+		failed_detail: list[str] = []
 		for key, task in tasks.items():
 			if task.done() and not task.cancelled():
 				try:
 					results[key] = task.result()
 				except Exception as e:
-					self.logger.warning(f'CDP request {key} failed with exception: {e}')
+					self.logger.warning(
+						f'CDP request {key} failed with exception after {elapsed_ms}ms: {e}'
+					)
 					failed.append(key)
+					failed_detail.append(f'{key}@{elapsed_ms}ms(exc:{type(e).__name__})')
 			else:
-				self.logger.warning(f'CDP request {key} timed out')
+				self.logger.warning(f'CDP request {key} timed out after {elapsed_ms}ms')
 				failed.append(key)
+				failed_detail.append(f'{key}@{elapsed_ms}ms(timeout)')
 
 		# If any required tasks failed, raise an exception
 		if failed:
-			raise TimeoutError(f'CDP requests failed or timed out: {", ".join(failed)}')
+			raise TimeoutError(
+				f'CDP requests failed or timed out: {", ".join(failed_detail)}'
+			)
 
 		snapshot = results['snapshot']
 		dom_tree = results['dom_tree']

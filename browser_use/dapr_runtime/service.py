@@ -760,18 +760,47 @@ async def _run_browser_use_turn_async(payload: dict[str, Any]) -> dict[str, Any]
 		else None
 	)
 
-	agent = Agent(
-		task=task,
-		llm=_build_llm(agent_config),
-		browser=browser,
-		tools=tools,
-		extend_system_message=extend_system_message,
-		llm_timeout=int(agent_config.get('timeoutMinutes') or 90) * 60,
-		step_timeout=DEFAULT_STEP_TIMEOUT,
-		injected_agent_state=injected_state,
-		register_new_step_callback=_on_step,
-		register_done_callback=_on_done,
-	)
+	agent_init_kwargs: dict[str, Any] = {
+		'task': task,
+		'llm': _build_llm(agent_config),
+		'browser': browser,
+		'tools': tools,
+		'extend_system_message': extend_system_message,
+		'llm_timeout': int(agent_config.get('timeoutMinutes') or 90) * 60,
+		'step_timeout': DEFAULT_STEP_TIMEOUT,
+		'injected_agent_state': injected_state,
+		'register_new_step_callback': _on_step,
+		'register_done_callback': _on_done,
+	}
+
+	# Per-task tunable overrides from the workflow JSON's
+	# do[].browser_use_agent.with.agentKwargs block. Whitelist supported
+	# keys so a workflow shipping unknown kwargs against an older
+	# browser-use version warns instead of crashing the agent.
+	_SUPPORTED_AGENT_OVERRIDES = {
+		'vision_detail_level',
+		'max_actions_per_step',
+		'max_history_items',
+		'max_failures',
+		'use_thinking',
+		'use_vision',
+		'flash_mode',
+		'step_timeout',
+		'llm_timeout',
+	}
+	override = agent_config.get('agentKwargs') or payload.get('agentKwargs') or {}
+	if isinstance(override, dict):
+		for k, v in override.items():
+			if k in _SUPPORTED_AGENT_OVERRIDES:
+				agent_init_kwargs[k] = v
+				logger.info('Applying agentKwargs override from workflow: %s=%r', k, v)
+			else:
+				logger.warning(
+					'Ignoring unsupported agentKwargs key from workflow: %s (not in whitelist)',
+					k,
+				)
+
+	agent = Agent(**agent_init_kwargs)
 
 	history: AgentHistoryList | None = None
 	result_payload: dict[str, Any] | None = None
